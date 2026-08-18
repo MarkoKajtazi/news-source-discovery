@@ -83,7 +83,7 @@ layer, while `DISCOVERY_SOURCE` results can be crawled recursively to find more 
 
 ## Not Yet Implemented
 
-- CLI arguments for city/country
+- FastAPI endpoints
 - Batch mode for multiple locations
 - RSS feed validation (confirming discovered feeds are live)
 - Merging heuristic + LLM crawl into a single pass (currently crawls each site twice)
