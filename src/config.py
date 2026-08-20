@@ -90,10 +90,12 @@ REJECTED_PATTERNS = [
 ]
 
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/chat"
 MODEL = "gpt-oss:120b-cloud"
-OLLAMA_PROVIDER = f"ollama/{MODEL}"
+
+# Homepage markdown is truncated before being sent for extraction.
+LLM_EXTRACTION_MAX_CHARS = 12000
 
 SYSTEM_PROMPT = """\
 You are a news source classifier. You will receive information about a website \
@@ -133,17 +135,21 @@ CLASSIFICATION_SCHEMA = {
 }
 
 LLM_EXTRACTION_INSTRUCTION = """\
-Analyze this website content and extract the following information. \
+You analyze website homepages and extract structured information about them. \
 The website may be in any language — analyze the actual content regardless of language.
 
-Determine:
-- Is this a news website that publishes articles?
-- Does it publish original articles or just aggregate/link to other sources?
-- What language is the content in? (use ISO 639-1 code, e.g. "mk", "en", "ru")
-- What type of site is it? (news portal, news aggregator, newspaper, TV station, blog, directory, government, other)
-- What editorial sections/categories does it have? (e.g. politics, sport, economy, world)
-- Does it appear to have an RSS feed?
-- Brief description of what the site is about (one sentence)"""
+Respond with a JSON object containing exactly these fields:
+- "is_news_site": boolean — does this website publish news articles?
+- "has_original_articles": boolean — does it publish original reporting, or \
+does it only aggregate and link to other sources?
+- "language": string — ISO 639-1 code of the content, e.g. "mk", "en", "ru"
+- "content_type": one of "news_portal", "news_aggregator", "newspaper", \
+"tv_station", "radio_station", "blog", "directory", "government", "other"
+- "sections": array of strings — editorial sections/categories found on the \
+site, e.g. ["politics", "sport", "economy"]
+- "site_description": string — one sentence describing what the site is about
+
+Use exactly these field names. Respond ONLY with the JSON object, no other text."""
 
 LLM_EXTRACTION_SCHEMA = {
     "type": "object",
@@ -169,17 +175,26 @@ LLM_EXTRACTION_SCHEMA = {
             "items": {"type": "string"},
             "description": "Editorial sections/categories found on the site",
         },
-        "has_rss": {
-            "type": "boolean",
-            "description": "Whether the site appears to have RSS feed links",
-        },
         "site_description": {
             "type": "string",
             "description": "One sentence describing what this website is about",
         },
     },
-    "required": ["is_news_site", "has_original_articles", "language", "content_type", "sections", "has_rss", "site_description"],
+    "required": ["is_news_site", "has_original_articles", "language", "content_type", "sections", "site_description"],
 }
+
+# Probed when a homepage's <head> exposes no feed links.
+FEED_PATHS = [
+    "/feed",
+    "/rss",
+    "/rss.xml",
+    "/feed.xml",
+    "/atom.xml",
+    "/index.xml",
+]
+
+# WordPress comment feeds carry no articles — useless for ingestion.
+FEED_URL_BLOCKLIST = ["/comments/feed"]
 
 SCORING_WEIGHTS = {
     "tld_match": 15,

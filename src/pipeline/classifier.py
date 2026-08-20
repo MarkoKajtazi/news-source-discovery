@@ -18,7 +18,7 @@ def _build_candidate_summary(candidate: Candidate) -> str:
         f"Page title: {signals.page_title}",
         f"Meta description: {signals.meta_description}",
         f"Language: {signals.language}",
-        f"RSS feeds: {len(signals.rss_feeds)}",
+        f"RSS feeds: {', '.join(signals.rss_feeds[:5]) or 'none'}",
         f"JSON-LD types: {', '.join(signals.json_ld_types) or 'none'}",
         f"Internal links: {signals.internal_links_count}",
         f"Article-like paths: {signals.article_like_paths}",
@@ -38,7 +38,6 @@ def _build_candidate_summary(candidate: Candidate) -> str:
         parts.append(f"LLM analysis - Content type: {llm.content_type}")
         parts.append(f"LLM analysis - Language: {llm.language}")
         parts.append(f"LLM analysis - Sections: {', '.join(llm.sections[:10]) or 'none'}")
-        parts.append(f"LLM analysis - Has RSS: {llm.has_rss}")
         parts.append(f"LLM analysis - Description: {llm.site_description}")
     return "\n".join(parts)
 

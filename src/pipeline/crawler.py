@@ -5,16 +5,22 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, LLMConfig
-from crawl4ai.extraction_strategy import LLMExtractionStrategy
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
 from src.config import (
+    FEED_PATHS,
+    FEED_URL_BLOCKLIST,
     LLM_EXTRACTION_INSTRUCTION,
+    LLM_EXTRACTION_MAX_CHARS,
     LLM_EXTRACTION_SCHEMA,
-    OLLAMA_BASE_URL,
-    OLLAMA_PROVIDER,
+    MODEL,
+    OLLAMA_URL,
 )
 from src.models import Candidate, CrawlSignals, LLMSignals, Location, RobotsTxt
+
+
+def _is_useful_feed(url: str) -> bool:
+    return not any(blocked in url.lower() for blocked in FEED_URL_BLOCKLIST)
 
 
 def _extract_rss_feeds(soup: BeautifulSoup, base_url: str) -> list[str]:
@@ -22,8 +28,43 @@ def _extract_rss_feeds(soup: BeautifulSoup, base_url: str) -> list[str]:
     for link in soup.find_all("link", type=re.compile(r"application/(rss|atom)\+xml", re.I)):
         href = link.get("href")
         if href:
-            feeds.append(urljoin(base_url, href))
+            full = urljoin(base_url, href)
+            if _is_useful_feed(full):
+                feeds.append(full)
     return feeds
+
+
+def _looks_like_feed(content_type: str, body: str) -> bool:
+    """Confirm a response is really a feed.
+
+    Status code alone is not enough — some sites (time.mk) return 200 text/html
+    for /rss rather than a 404.
+    """
+    if "xml" not in content_type.lower():
+        return False
+    head = body[:500].lstrip()
+    return head.startswith("<?xml") or "<rss" in head or "<feed" in head
+
+
+async def _probe_feed_paths(client: httpx.AsyncClient, domain: str) -> list[str]:
+    """Try well-known feed paths when the homepage <head> exposes none."""
+    found = []
+    seen = set()
+    for path in FEED_PATHS:
+        try:
+            resp = await client.get(f"https://{domain}{path}", timeout=8.0)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+        if _looks_like_feed(resp.headers.get("content-type", ""), resp.text):
+            url = str(resp.url)
+            # /feed and /feed/ are the same resource on most CMSes
+            key = url.rstrip("/")
+            if _is_useful_feed(url) and key not in seen:
+                seen.add(key)
+                found.append(url)
+    return found
 
 
 def _extract_json_ld(soup: BeautifulSoup) -> list[dict]:
@@ -160,38 +201,39 @@ def _extract_location(soup: BeautifulSoup, json_ld: list[dict]) -> Location:
     return Location(name=name, country=country)
 
 
-async def _fetch_robots_txt(domain: str, timeout: float = 10.0) -> RobotsTxt:
+async def _fetch_robots_txt(
+    client: httpx.AsyncClient, domain: str, timeout: float = 10.0
+) -> RobotsTxt:
     """Fetch and parse robots.txt."""
     url = f"https://{domain}/robots.txt"
     result = RobotsTxt()
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.get(url, timeout=timeout)
-            if resp.status_code != 200:
-                result.raw = f"HTTP {resp.status_code}"
-                return result
-            text = resp.text
-            result.raw = text[:2000]
+        resp = await client.get(url, timeout=timeout)
+        if resp.status_code != 200:
+            result.raw = f"HTTP {resp.status_code}"
+            return result
+        text = resp.text
+        result.raw = text[:2000]
 
-            current_agent_applies = False
-            for line in text.splitlines():
-                line = line.strip()
-                if line.lower().startswith("user-agent:"):
-                    agent = line.split(":", 1)[1].strip().lower()
-                    current_agent_applies = agent == "*"
-                elif current_agent_applies:
-                    if line.lower().startswith("disallow:"):
-                        path = line.split(":", 1)[1].strip()
-                        if path:
-                            result.disallowed_paths.append(path)
-                    elif line.lower().startswith("allow:"):
-                        path = line.split(":", 1)[1].strip()
-                        if path:
-                            result.allowed_paths.append(path)
-                if line.lower().startswith("sitemap:"):
-                    sitemap_url = line.split(":", 1)[1].strip()
-                    if sitemap_url:
-                        result.sitemaps.append(sitemap_url)
+        current_agent_applies = False
+        for line in text.splitlines():
+            line = line.strip()
+            if line.lower().startswith("user-agent:"):
+                agent = line.split(":", 1)[1].strip().lower()
+                current_agent_applies = agent == "*"
+            elif current_agent_applies:
+                if line.lower().startswith("disallow:"):
+                    path = line.split(":", 1)[1].strip()
+                    if path:
+                        result.disallowed_paths.append(path)
+                elif line.lower().startswith("allow:"):
+                    path = line.split(":", 1)[1].strip()
+                    if path:
+                        result.allowed_paths.append(path)
+            if line.lower().startswith("sitemap:"):
+                sitemap_url = line.split(":", 1)[1].strip()
+                if sitemap_url:
+                    result.sitemaps.append(sitemap_url)
     except Exception:
         result.raw = "fetch failed"
     return result
@@ -208,12 +250,23 @@ def _extract_json_ld_types(json_ld: list[dict]) -> list[str]:
     return sorted(types)
 
 
-async def crawl_candidate(crawler: AsyncWebCrawler, candidate: Candidate) -> Candidate:
-    """Crawl a candidate's homepage and extract site signals."""
+async def crawl_candidate(
+    crawler: AsyncWebCrawler, client: httpx.AsyncClient, candidate: Candidate
+) -> tuple[Candidate, str]:
+    """Crawl a candidate's homepage and extract site signals.
+
+    Returns the candidate and the page markdown. The markdown is handed to the
+    LLM extraction step so the page is only ever fetched once.
+    """
     signals = CrawlSignals()
+    markdown = ""
+
+    # The search hit is often a deep page; feed links and structured data
+    # live on the homepage.
+    page_url = candidate.homepage_url or candidate.url
 
     # Fetch robots.txt
-    signals.robots_txt = await _fetch_robots_txt(candidate.domain)
+    signals.robots_txt = await _fetch_robots_txt(client, candidate.domain)
 
     try:
         config = CrawlerRunConfig(
@@ -221,12 +274,12 @@ async def crawl_candidate(crawler: AsyncWebCrawler, candidate: Candidate) -> Can
             page_timeout=20000,
             wait_until="domcontentloaded",
         )
-        result = await crawler.arun(url=candidate.url, config=config)
+        result = await crawler.arun(url=page_url, config=config)
 
         if not result.success:
             print(f"  [fail] {candidate.domain}: {result.error_message}")
             candidate.signals = signals
-            return candidate
+            return candidate, markdown
 
         html = result.html
         signals.crawl_success = True
@@ -239,15 +292,17 @@ async def crawl_candidate(crawler: AsyncWebCrawler, candidate: Candidate) -> Can
         signals.meta_description = _extract_meta(soup, "description")
         signals.language = _extract_language(soup)
 
-        # RSS feeds
-        signals.rss_feeds = _extract_rss_feeds(soup, candidate.url)
+        # RSS feeds — fall back to probing well-known paths if <head> has none
+        signals.rss_feeds = _extract_rss_feeds(soup, page_url)
+        if not signals.rss_feeds:
+            signals.rss_feeds = await _probe_feed_paths(client, candidate.domain)
 
         # JSON-LD
         json_ld = _extract_json_ld(soup)
         signals.json_ld_types = _extract_json_ld_types(json_ld)
 
         # Internal links and article paths
-        internal_paths = _extract_internal_links(soup, candidate.url, candidate.domain)
+        internal_paths = _extract_internal_links(soup, page_url, candidate.domain)
         signals.internal_links_count = len(internal_paths)
         signals.article_like_paths = _count_article_paths(internal_paths)
 
@@ -265,44 +320,16 @@ async def crawl_candidate(crawler: AsyncWebCrawler, candidate: Candidate) -> Can
 
         # Content snippet from Crawl4AI's extracted markdown
         if result.markdown:
-            text = result.markdown.raw_markdown if hasattr(result.markdown, "raw_markdown") else str(result.markdown)
-            signals.content_snippet = text[:500]
+            markdown = result.markdown.raw_markdown if hasattr(result.markdown, "raw_markdown") else str(result.markdown)
+            signals.content_snippet = markdown[:500]
 
     except Exception as e:
         print(f"  [error] {candidate.domain}: {e}")
 
     candidate.signals = signals
-    return candidate
+    return candidate, markdown
 
 
-async def crawl_candidates(candidates: list[Candidate], max_concurrent: int = 5) -> list[Candidate]:
-    """Crawl all candidates and enrich them with signals."""
-    print(f"\nCrawling {len(candidates)} candidates (max {max_concurrent} concurrent)...\n")
-
-    semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def limited_crawl(crawler, candidate, index):
-        async with semaphore:
-            print(f"  [{index + 1}/{len(candidates)}] Crawling: {candidate.domain}")
-            return await crawl_candidate(crawler, candidate)
-
-    browser_config = BrowserConfig(headless=True, verbose=False)
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        tasks = [limited_crawl(crawler, c, i) for i, c in enumerate(candidates)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    enriched = []
-    for i, r in enumerate(results):
-        if isinstance(r, Exception):
-            print(f"  [error] {candidates[i].domain}: {r}")
-            candidates[i].signals = CrawlSignals()
-            enriched.append(candidates[i])
-        else:
-            enriched.append(r)
-
-    success = sum(1 for c in enriched if c.signals and c.signals.crawl_success)
-    print(f"\n  Crawl complete: {success}/{len(enriched)} successful\n")
-    return enriched
 
 
 def _has_weak_signals(signals: CrawlSignals) -> bool:
@@ -315,19 +342,22 @@ def _has_weak_signals(signals: CrawlSignals) -> bool:
     )
 
 
-def _parse_llm_result(raw: str) -> LLMSignals:
+def _parse_llm_result(raw: str, domain: str = "") -> LLMSignals:
     """Parse LLM extraction result into LLMSignals."""
     try:
         data = json.loads(raw)
         if isinstance(data, list) and data:
             data = data[0]
+        # The model sometimes invents its own field names; without this the
+        # .get() defaults below would quietly produce an empty LLMSignals.
+        if not any(k in data for k in LLM_EXTRACTION_SCHEMA["properties"]):
+            print(f"    [llm schema mismatch] {domain}: got keys {sorted(data)[:6]}")
         return LLMSignals(
             is_news_site=bool(data.get("is_news_site", False)),
             has_original_articles=bool(data.get("has_original_articles", False)),
             language=str(data.get("language", "")),
             content_type=str(data.get("content_type", "")),
             sections=list(data.get("sections", [])),
-            has_rss=bool(data.get("has_rss", False)),
             site_description=str(data.get("site_description", "")),
         )
     except (json.JSONDecodeError, TypeError, KeyError) as e:
@@ -335,77 +365,103 @@ def _parse_llm_result(raw: str) -> LLMSignals:
         return LLMSignals()
 
 
-async def llm_crawl_candidate(crawler: AsyncWebCrawler, candidate: Candidate) -> Candidate:
-    """Re-crawl a candidate with LLM extraction to enhance weak signals."""
-    llm_config = LLMConfig(
-        provider=OLLAMA_PROVIDER,
-        api_token="no-token",
-        base_url=OLLAMA_BASE_URL,
-    )
-    strategy = LLMExtractionStrategy(
-        llm_config=llm_config,
-        instruction=LLM_EXTRACTION_INSTRUCTION,
-        schema=LLM_EXTRACTION_SCHEMA,
-        extraction_type="schema",
-        apply_chunking=False,
-        verbose=False,
-    )
-    config = CrawlerRunConfig(
-        word_count_threshold=10,
-        page_timeout=30000,
-        wait_until="domcontentloaded",
-        extraction_strategy=strategy,
-    )
-
+async def extract_signals_llm(
+    client: httpx.AsyncClient, candidate: Candidate, markdown: str
+) -> Candidate:
+    """Extract signals from already-fetched markdown. Does not fetch the page."""
     try:
-        result = await crawler.arun(url=candidate.url, config=config)
-        if result.success and result.extracted_content:
-            llm_signals = _parse_llm_result(result.extracted_content)
-            candidate.signals.llm_signals = llm_signals
+        resp = await client.post(
+            OLLAMA_URL,
+            json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": LLM_EXTRACTION_INSTRUCTION},
+                    {"role": "user", "content": markdown[:LLM_EXTRACTION_MAX_CHARS]},
+                ],
+                "stream": False,
+                "format": LLM_EXTRACTION_SCHEMA,
+            },
+            timeout=180.0,
+        )
+        resp.raise_for_status()
+        llm_signals = _parse_llm_result(resp.json()["message"]["content"], candidate.domain)
+        candidate.signals.llm_signals = llm_signals
 
-            # Fill in gaps from heuristic extraction
-            if not candidate.signals.language and llm_signals.language:
-                candidate.signals.language = llm_signals.language
-            if not candidate.signals.sections and llm_signals.sections:
-                candidate.signals.sections = llm_signals.sections
-        else:
-            print(f"    [llm fail] {candidate.domain}: {getattr(result, 'error_message', 'no content')}")
+        # Fill in gaps from heuristic extraction
+        if not candidate.signals.language and llm_signals.language:
+            candidate.signals.language = llm_signals.language
+        if not candidate.signals.sections and llm_signals.sections:
+            candidate.signals.sections = llm_signals.sections
     except Exception as e:
         print(f"    [llm error] {candidate.domain}: {e}")
 
     return candidate
 
 
-async def llm_crawl_candidates(
-    candidates: list[Candidate], max_concurrent: int = 3
+async def crawl_and_extract(
+    candidates: list[Candidate],
+    max_concurrent: int = 5,
+    max_llm_concurrent: int = 3,
+    use_llm: bool = True,
+    llm_only_weak: bool = False,
 ) -> list[Candidate]:
-    """Run LLM extraction on all successfully crawled candidates."""
-    targets = [c for c in candidates if c.signals and c.signals.crawl_success]
+    """Crawl every candidate once, extracting heuristic and LLM signals.
 
-    if not targets:
-        print("\n  No successfully crawled candidates — skipping LLM extraction\n")
-        return candidates
+    Each page is fetched exactly once; the resulting markdown feeds both the
+    BeautifulSoup heuristics and the Ollama extraction. The page slot is
+    released before the LLM slot is taken, so a slow model never holds browser
+    slots idle, and a candidate's LLM call starts as soon as its own page is
+    done rather than after the whole crawl finishes.
+    """
+    print(f"\nCrawling {len(candidates)} candidates (max {max_concurrent} concurrent)...")
+    if use_llm:
+        scope = "weak-signal candidates" if llm_only_weak else "all candidates"
+        print(f"LLM extraction: {scope} (max {max_llm_concurrent} concurrent)\n")
+    else:
+        print("LLM extraction: disabled\n")
 
-    print(f"\nLLM extraction for {len(targets)} candidates (max {max_concurrent} concurrent)...\n")
+    page_sem = asyncio.Semaphore(max_concurrent)
+    llm_sem = asyncio.Semaphore(max_llm_concurrent)
+    llm_done = 0
 
-    semaphore = asyncio.Semaphore(max_concurrent)
+    async def process(crawler, client, candidate, index):
+        nonlocal llm_done
+        async with page_sem:
+            print(f"  [{index + 1}/{len(candidates)}] Crawling: {candidate.domain}")
+            candidate, markdown = await crawl_candidate(crawler, client, candidate)
 
-    async def limited_llm_crawl(crawler, candidate, index):
-        async with semaphore:
-            print(f"  [{index + 1}/{len(targets)}] LLM extracting: {candidate.domain}")
-            return await llm_crawl_candidate(crawler, candidate)
+        if not (use_llm and candidate.signals.crawl_success and markdown):
+            return candidate
+        if llm_only_weak and not _has_weak_signals(candidate.signals):
+            return candidate
+
+        async with llm_sem:
+            print(f"    LLM extracting: {candidate.domain}")
+            candidate = await extract_signals_llm(client, candidate, markdown)
+            if candidate.signals.llm_signals:
+                llm_done += 1
+        return candidate
 
     browser_config = BrowserConfig(headless=True, verbose=False)
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        tasks = [limited_llm_crawl(crawler, c, i) for i, c in enumerate(targets)]
+    async with (
+        AsyncWebCrawler(config=browser_config) as crawler,
+        httpx.AsyncClient(follow_redirects=True) as client,
+    ):
+        tasks = [process(crawler, client, c, i) for i, c in enumerate(candidates)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    enhanced = 0
+    enriched = []
     for i, r in enumerate(results):
         if isinstance(r, Exception):
-            print(f"  [error] {targets[i].domain}: {r}")
-        elif r.signals and r.signals.llm_signals:
-            enhanced += 1
+            print(f"  [error] {candidates[i].domain}: {r}")
+            candidates[i].signals = CrawlSignals()
+            enriched.append(candidates[i])
+        else:
+            enriched.append(r)
 
-    print(f"\n  LLM extraction complete: {enhanced}/{len(targets)} enhanced\n")
-    return candidates
+    success = sum(1 for c in enriched if c.signals and c.signals.crawl_success)
+    print(f"\n  Crawl complete: {success}/{len(enriched)} successful")
+    if use_llm:
+        print(f"  LLM extraction: {llm_done} enhanced")
+    print()
+    return enriched

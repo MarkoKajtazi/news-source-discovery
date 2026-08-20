@@ -6,7 +6,7 @@ from dataclasses import asdict
 from src.config import OUTPUT_DIR
 from src.models import Candidate
 from src.pipeline.classifier import classify_candidates
-from src.pipeline.crawler import crawl_candidates, llm_crawl_candidates
+from src.pipeline.crawler import crawl_and_extract
 from src.pipeline.discover import discover
 from src.pipeline.scorer import score_candidates
 
@@ -41,11 +41,8 @@ def main():
     results = discover(city, country)
     _save_stage(location_dir, "1_discovery.json", results)
 
-    # Crawl candidates to extract site signals
-    enriched = asyncio.run(crawl_candidates(results))
-
-    # LLM extraction for candidates with weak heuristic signals
-    enriched = asyncio.run(llm_crawl_candidates(enriched))
+    # Crawl candidates for site signals, then run LLM extraction on the same browser
+    enriched = asyncio.run(crawl_and_extract(results))
     _save_stage(location_dir, "2_crawl.json", enriched)
 
     # Classify candidates using Ollama

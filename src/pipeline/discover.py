@@ -74,6 +74,18 @@ def extract_domain(url: str) -> str:
     return domain
 
 
+def extract_homepage(url: str) -> str:
+    """Reduce a search-result URL to the site's homepage.
+
+    Search hits are often deep pages (e.g. /where/north-macedonia), which lack
+    the <head> feed links and structured data the crawler looks for.
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    return f"{parsed.scheme}://{parsed.netloc}/"
+
+
 def deduplicate(results: list[dict]) -> dict[str, Candidate]:
     """Deduplicate by domain while preserving discovery evidence."""
     seen: dict[str, Candidate] = {}
@@ -89,6 +101,7 @@ def deduplicate(results: list[dict]) -> dict[str, Candidate]:
             seen[domain] = Candidate(
                 domain=domain,
                 url=url,
+                homepage_url=extract_homepage(url),
                 title=r.get("title", ""),
                 description=r.get("body", ""),
             )

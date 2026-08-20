@@ -24,7 +24,6 @@ class LLMSignals:
     language: str = ""
     content_type: str = ""
     sections: list[str] = field(default_factory=list)
-    has_rss: bool = False
     site_description: str = ""
 
 
@@ -65,6 +64,7 @@ class ScoringResult:
 class Candidate:
     domain: str = ""
     url: str = ""
+    homepage_url: str = ""
     title: str = ""
     description: str = ""
     queries: list[str] = field(default_factory=list)
