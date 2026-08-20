@@ -114,6 +114,23 @@ press freedom indexes, journalism organizations, Wikipedia/wiki pages listing me
 Examples: hotels, tourism sites, app stores, SEO tools, government portals, \
 academic papers, e-commerce, social media, encyclopedias (unless listing media).
 
+Weigh feed evidence heavily — every feed listed has been fetched and parsed, so \
+its entry counts and dates are facts, not guesses:
+- A feed with recent entries that originate on the site's own domain, from a \
+single outlet, is strong evidence of NEWS_SOURCE.
+- A feed whose entries mostly originate OFF the site's own domain, or that names \
+many distinct originating outlets, means the site republishes other people's \
+reporting. Classify it DISCOVERY_SOURCE, not NEWS_SOURCE, however much it looks \
+like a news portal. One originating outlet means a publisher; dozens means an \
+aggregator.
+- "headlines only" feeds combined with a high off-domain ratio point the same \
+way: aggregator, so DISCOVERY_SOURCE.
+- No valid feed is weak evidence at most. Plenty of real news sites publish none.
+
+Likewise treat an LLM analysis of content_type "news_aggregator", or \
+"Has original articles: False", as strong evidence for DISCOVERY_SOURCE rather \
+than NEWS_SOURCE.
+
 Respond with a JSON object containing exactly these fields:
 - "classification": one of "NEWS_SOURCE", "DISCOVERY_SOURCE", or "REJECT"
 - "confidence": a number from 0.0 to 1.0
@@ -196,6 +213,18 @@ FEED_PATHS = [
 # WordPress comment feeds carry no articles — useless for ingestion.
 FEED_URL_BLOCKLIST = ["/comments/feed"]
 
+# Feed validation. A nominated URL is only kept once it has been fetched and
+# parsed as a real feed carrying entries — HTTP 200 alone proves nothing, some
+# sites serve text/html for /rss instead of a 404.
+FEED_FETCH_TIMEOUT = 10.0
+FEED_MAX_BYTES = 2_000_000
+FEED_MAX_PER_CANDIDATE = 3
+FEED_MIN_ENTRIES = 1
+# Entry ages used by the scorer to grade feed freshness (days).
+FEED_FRESH_DAYS = 2
+FEED_RECENT_DAYS = 7
+FEED_STALE_DAYS = 30
+
 SCORING_WEIGHTS = {
     "tld_match": 15,
     "language_match": 15,
@@ -257,6 +286,52 @@ COUNTRY_TLDS: dict[str, list[str]] = {
     "England": [".uk", ".co.uk"],
     "United Kingdom": [".uk", ".co.uk"],
     "United States": [".us"],
+}
+
+# ISO 3166-1 alpha-2 codes. Needed because location extraction reads
+# schema.org `addressCountry` / `geo.country`, which carry codes ("MK") while
+# the pipeline is driven by full country names ("North Macedonia").
+COUNTRY_ISO2: dict[str, str] = {
+    "North Macedonia": "MK",
+    "Serbia": "RS",
+    "Croatia": "HR",
+    "Bosnia and Herzegovina": "BA",
+    "Slovenia": "SI",
+    "Bulgaria": "BG",
+    "Albania": "AL",
+    "Kosovo": "XK",
+    "Greece": "GR",
+    "Turkey": "TR",
+    "Germany": "DE",
+    "France": "FR",
+    "Spain": "ES",
+    "Italy": "IT",
+    "Portugal": "PT",
+    "Netherlands": "NL",
+    "Poland": "PL",
+    "Romania": "RO",
+    "Czech Republic": "CZ",
+    "Hungary": "HU",
+    "Sweden": "SE",
+    "Norway": "NO",
+    "Denmark": "DK",
+    "Finland": "FI",
+    "Ukraine": "UA",
+    "Russia": "RU",
+    "Japan": "JP",
+    "South Korea": "KR",
+    "China": "CN",
+    "India": "IN",
+    "Brazil": "BR",
+    "Mexico": "MX",
+    "Argentina": "AR",
+    "Egypt": "EG",
+    "Saudi Arabia": "SA",
+    "Iran": "IR",
+    "Israel": "IL",
+    "England": "GB",
+    "United Kingdom": "GB",
+    "United States": "US",
 }
 
 COUNTRY_LANGUAGES: dict[str, list[str]] = {

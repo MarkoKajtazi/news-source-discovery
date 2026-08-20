@@ -8,8 +8,6 @@ from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
 from src.config import (
-    FEED_PATHS,
-    FEED_URL_BLOCKLIST,
     LLM_EXTRACTION_INSTRUCTION,
     LLM_EXTRACTION_MAX_CHARS,
     LLM_EXTRACTION_SCHEMA,
@@ -17,54 +15,23 @@ from src.config import (
     OLLAMA_URL,
 )
 from src.models import Candidate, CrawlSignals, LLMSignals, Location, RobotsTxt
+from src.pipeline.feeds import discover_feeds, is_useful_feed
 
 
-def _is_useful_feed(url: str) -> bool:
-    return not any(blocked in url.lower() for blocked in FEED_URL_BLOCKLIST)
+def _nominate_head_feeds(soup: BeautifulSoup, base_url: str) -> list[str]:
+    """Collect feed URLs advertised in <head>.
 
-
-def _extract_rss_feeds(soup: BeautifulSoup, base_url: str) -> list[str]:
-    feeds = []
+    Nomination only — these are unverified URLs. `feeds.discover_feeds` decides
+    whether any of them is really a feed.
+    """
+    nominated = []
     for link in soup.find_all("link", type=re.compile(r"application/(rss|atom)\+xml", re.I)):
         href = link.get("href")
         if href:
             full = urljoin(base_url, href)
-            if _is_useful_feed(full):
-                feeds.append(full)
-    return feeds
-
-
-def _looks_like_feed(content_type: str, body: str) -> bool:
-    """Confirm a response is really a feed.
-
-    Status code alone is not enough — some sites (time.mk) return 200 text/html
-    for /rss rather than a 404.
-    """
-    if "xml" not in content_type.lower():
-        return False
-    head = body[:500].lstrip()
-    return head.startswith("<?xml") or "<rss" in head or "<feed" in head
-
-
-async def _probe_feed_paths(client: httpx.AsyncClient, domain: str) -> list[str]:
-    """Try well-known feed paths when the homepage <head> exposes none."""
-    found = []
-    seen = set()
-    for path in FEED_PATHS:
-        try:
-            resp = await client.get(f"https://{domain}{path}", timeout=8.0)
-        except Exception:
-            continue
-        if resp.status_code != 200:
-            continue
-        if _looks_like_feed(resp.headers.get("content-type", ""), resp.text):
-            url = str(resp.url)
-            # /feed and /feed/ are the same resource on most CMSes
-            key = url.rstrip("/")
-            if _is_useful_feed(url) and key not in seen:
-                seen.add(key)
-                found.append(url)
-    return found
+            if is_useful_feed(full):
+                nominated.append(full)
+    return nominated
 
 
 def _extract_json_ld(soup: BeautifulSoup) -> list[dict]:
@@ -252,14 +219,17 @@ def _extract_json_ld_types(json_ld: list[dict]) -> list[str]:
 
 async def crawl_candidate(
     crawler: AsyncWebCrawler, client: httpx.AsyncClient, candidate: Candidate
-) -> tuple[Candidate, str]:
+) -> tuple[Candidate, str, list[str]]:
     """Crawl a candidate's homepage and extract site signals.
 
-    Returns the candidate and the page markdown. The markdown is handed to the
-    LLM extraction step so the page is only ever fetched once.
+    Returns the candidate, the page markdown, and the feed URLs nominated by
+    `<head>`. The markdown is handed to the LLM extraction step so the page is
+    only ever fetched once; the nominated URLs go to feed validation, which
+    runs outside the browser semaphore since it is plain HTTP.
     """
     signals = CrawlSignals()
     markdown = ""
+    nominated_feeds: list[str] = []
 
     # The search hit is often a deep page; feed links and structured data
     # live on the homepage.
@@ -279,7 +249,7 @@ async def crawl_candidate(
         if not result.success:
             print(f"  [fail] {candidate.domain}: {result.error_message}")
             candidate.signals = signals
-            return candidate, markdown
+            return candidate, markdown, nominated_feeds
 
         html = result.html
         signals.crawl_success = True
@@ -292,10 +262,8 @@ async def crawl_candidate(
         signals.meta_description = _extract_meta(soup, "description")
         signals.language = _extract_language(soup)
 
-        # RSS feeds — fall back to probing well-known paths if <head> has none
-        signals.rss_feeds = _extract_rss_feeds(soup, page_url)
-        if not signals.rss_feeds:
-            signals.rss_feeds = await _probe_feed_paths(client, candidate.domain)
+        # Feed URLs advertised in <head>; validated later, outside this slot
+        nominated_feeds = _nominate_head_feeds(soup, page_url)
 
         # JSON-LD
         json_ld = _extract_json_ld(soup)
@@ -327,17 +295,22 @@ async def crawl_candidate(
         print(f"  [error] {candidate.domain}: {e}")
 
     candidate.signals = signals
-    return candidate, markdown
+    return candidate, markdown, nominated_feeds
 
 
+def _has_weak_signals(signals: CrawlSignals, nominated_feeds: list[str]) -> bool:
+    """Check if heuristic extraction produced weak signals.
 
-
-def _has_weak_signals(signals: CrawlSignals) -> bool:
-    """Check if heuristic extraction produced weak signals."""
+    Uses the *nominated* feed URLs rather than validated ones on purpose: this
+    decides whether to spend an LLM call, and it runs concurrently with feed
+    validation, so reading `signals.feeds` here would be a race. Nominated
+    `<head>` links are also the better measure — they are a property of the
+    page the heuristics just read, whereas path probing is a network guess.
+    """
     return (
         signals.crawl_success
         and signals.article_like_paths == 0
-        and not signals.rss_feeds
+        and not nominated_feeds
         and not signals.language
     )
 
@@ -402,44 +375,70 @@ async def crawl_and_extract(
     candidates: list[Candidate],
     max_concurrent: int = 5,
     max_llm_concurrent: int = 3,
+    max_feed_concurrent: int = 5,
     use_llm: bool = True,
     llm_only_weak: bool = False,
 ) -> list[Candidate]:
-    """Crawl every candidate once, extracting heuristic and LLM signals.
+    """Crawl every candidate once, extracting heuristic, feed and LLM signals.
 
     Each page is fetched exactly once; the resulting markdown feeds both the
     BeautifulSoup heuristics and the Ollama extraction. The page slot is
-    released before the LLM slot is taken, so a slow model never holds browser
-    slots idle, and a candidate's LLM call starts as soon as its own page is
-    done rather than after the whole crawl finishes.
+    released before the LLM and feed slots are taken, so neither a slow model
+    nor a slow feed host holds browser slots idle, and a candidate's follow-up
+    work starts as soon as its own page is done rather than after the whole
+    crawl finishes.
+
+    Feed validation and LLM extraction run concurrently — they contend on
+    different resources (arbitrary web hosts vs. Ollama) and write disjoint
+    fields of `CrawlSignals`.
     """
     print(f"\nCrawling {len(candidates)} candidates (max {max_concurrent} concurrent)...")
     if use_llm:
         scope = "weak-signal candidates" if llm_only_weak else "all candidates"
-        print(f"LLM extraction: {scope} (max {max_llm_concurrent} concurrent)\n")
+        print(f"LLM extraction: {scope} (max {max_llm_concurrent} concurrent)")
     else:
-        print("LLM extraction: disabled\n")
+        print("LLM extraction: disabled")
+    print(f"Feed validation: max {max_feed_concurrent} concurrent\n")
 
     page_sem = asyncio.Semaphore(max_concurrent)
     llm_sem = asyncio.Semaphore(max_llm_concurrent)
+    feed_sem = asyncio.Semaphore(max_feed_concurrent)
     llm_done = 0
+    feeds_found = 0
 
     async def process(crawler, client, candidate, index):
-        nonlocal llm_done
+        nonlocal llm_done, feeds_found
         async with page_sem:
             print(f"  [{index + 1}/{len(candidates)}] Crawling: {candidate.domain}")
-            candidate, markdown = await crawl_candidate(crawler, client, candidate)
+            candidate, markdown, nominated = await crawl_candidate(crawler, client, candidate)
 
-        if not (use_llm and candidate.signals.crawl_success and markdown):
-            return candidate
-        if llm_only_weak and not _has_weak_signals(candidate.signals):
+        if not candidate.signals.crawl_success:
             return candidate
 
-        async with llm_sem:
-            print(f"    LLM extracting: {candidate.domain}")
-            candidate = await extract_signals_llm(client, candidate, markdown)
-            if candidate.signals.llm_signals:
-                llm_done += 1
+        async def validate():
+            nonlocal feeds_found
+            async with feed_sem:
+                candidate.signals.feeds = await discover_feeds(
+                    client, candidate.domain, nominated
+                )
+            valid = candidate.signals.rss_feeds
+            if valid:
+                feeds_found += 1
+                print(f"    Feeds validated: {candidate.domain} -> {len(valid)} live")
+
+        async def extract():
+            nonlocal llm_done
+            if not (use_llm and markdown):
+                return
+            if llm_only_weak and not _has_weak_signals(candidate.signals, nominated):
+                return
+            async with llm_sem:
+                print(f"    LLM extracting: {candidate.domain}")
+                await extract_signals_llm(client, candidate, markdown)
+                if candidate.signals.llm_signals:
+                    llm_done += 1
+
+        await asyncio.gather(validate(), extract())
         return candidate
 
     browser_config = BrowserConfig(headless=True, verbose=False)
@@ -463,5 +462,6 @@ async def crawl_and_extract(
     print(f"\n  Crawl complete: {success}/{len(enriched)} successful")
     if use_llm:
         print(f"  LLM extraction: {llm_done} enhanced")
+    print(f"  Feed validation: {feeds_found} candidates with at least one live feed")
     print()
     return enriched

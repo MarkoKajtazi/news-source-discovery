@@ -6,6 +6,33 @@ from src.config import CLASSIFICATION_SCHEMA, MODEL, OLLAMA_URL, SYSTEM_PROMPT
 from src.models import Candidate, ClassificationResult, CrawlSignals
 
 
+def _format_feeds(signals: CrawlSignals) -> str:
+    """Describe validated feeds as evidence, not as a URL list.
+
+    Every fact here was proved by fetching and parsing the feed, so the
+    classifier can weigh it far more heavily than a bare URL.
+    """
+    valid = [f for f in signals.feeds if f.valid]
+    if not valid:
+        if not signals.feeds:
+            return "none found"
+        tried = ", ".join(f"{f.url} -> {f.status}" for f in signals.feeds[:3])
+        return f"none valid (tried: {tried})"
+
+    described = []
+    for feed in valid:
+        bits = [f"{feed.entry_count} entries"]
+        if feed.latest_entry:
+            bits.append(f"latest entry {feed.latest_entry[:10]}")
+        else:
+            bits.append("no entry dates")
+        bits.append("full article text" if feed.has_full_content else "headlines only")
+        bits.append(f"{feed.external_link_ratio:.0%} of entries originate off-domain")
+        bits.append(f"{feed.distinct_sources} distinct originating outlet(s)")
+        described.append(f"{feed.url} ({'; '.join(bits)})")
+    return " | ".join(described)
+
+
 def _build_candidate_summary(candidate: Candidate) -> str:
     signals = candidate.signals or CrawlSignals()
     loc = signals.location
@@ -18,7 +45,7 @@ def _build_candidate_summary(candidate: Candidate) -> str:
         f"Page title: {signals.page_title}",
         f"Meta description: {signals.meta_description}",
         f"Language: {signals.language}",
-        f"RSS feeds: {', '.join(signals.rss_feeds[:5]) or 'none'}",
+        f"Validated feeds: {_format_feeds(signals)}",
         f"JSON-LD types: {', '.join(signals.json_ld_types) or 'none'}",
         f"Internal links: {signals.internal_links_count}",
         f"Article-like paths: {signals.article_like_paths}",

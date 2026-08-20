@@ -1,6 +1,12 @@
+from datetime import datetime, timezone
+
 from src.config import (
+    COUNTRY_ISO2,
     COUNTRY_LANGUAGES,
     COUNTRY_TLDS,
+    FEED_FRESH_DAYS,
+    FEED_RECENT_DAYS,
+    FEED_STALE_DAYS,
     POLLING_TIERS,
     SCORING_WEIGHTS as WEIGHTS,
 )
@@ -35,10 +41,42 @@ def _score_occurrences(occurrences: int) -> float:
     return min(occurrences * 3, WEIGHTS["search_occurrences"])
 
 
+def _days_since(iso_timestamp: str) -> float | None:
+    try:
+        when = datetime.fromisoformat(iso_timestamp)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - when).total_seconds() / 86400
+
+
 def _score_rss(signals: CrawlSignals) -> float:
-    if signals.rss_feeds:
-        return WEIGHTS["rss_available"]
-    return 0.0
+    """Grade validated feeds by freshness.
+
+    A feed that parses but has published nothing in a month is worth far less
+    for polling than one updated today, so this is graded rather than boolean.
+    """
+    valid = [f for f in signals.feeds if f.valid]
+    if not valid:
+        return 0.0
+
+    weight = WEIGHTS["rss_available"]
+    dated = [f.latest_entry for f in valid if f.latest_entry]
+    if not dated:
+        # Parses and carries entries, but no dates to confirm it is still live.
+        return weight * 0.5
+
+    age = _days_since(max(dated))
+    if age is None:
+        return weight * 0.5
+    if age <= FEED_FRESH_DAYS:
+        return weight
+    if age <= FEED_RECENT_DAYS:
+        return weight * 0.85
+    if age <= FEED_STALE_DAYS:
+        return weight * 0.6
+    return weight * 0.25
 
 
 def _score_article_paths(signals: CrawlSignals) -> float:
@@ -78,14 +116,31 @@ def _score_confidence(candidate: Candidate) -> float:
 
 
 def _score_location(signals: CrawlSignals, city: str | None, country: str) -> float:
+    """Score extracted geographic metadata against the requested location.
+
+    The extractors read schema.org `addressCountry` and `geo.country`, which
+    almost always carry an ISO code ("MK"), while `country` here is a full name
+    ("North Macedonia"). Comparing the two directly can never match, so the ISO
+    code is looked up rather than assumed.
+    """
     loc = signals.location
-    if not loc.name and not loc.country:
+    name = loc.name.lower().strip()
+    region = loc.country.lower().strip()
+    if not name and not region:
         return 0.0
-    name_lower = loc.name.lower()
-    country_lower = loc.country.lower()
-    if city and city.lower() in name_lower:
+
+    if city and city.lower() in name:
         return WEIGHTS["location_match"]
-    if country.lower() in country_lower or country.lower() in name_lower:
+
+    # The country field is matched exactly: a substring test on a two-letter
+    # code would let "mk" match "Denmark".
+    iso2 = COUNTRY_ISO2.get(country, "").lower()
+    if iso2 and region == iso2:
+        return WEIGHTS["location_match"] * 0.6
+
+    # The full name is long enough to substring-match safely, in either field.
+    full = country.lower()
+    if full in region or full in name:
         return WEIGHTS["location_match"] * 0.6
     return 0.0
 
