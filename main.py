@@ -1,57 +1,66 @@
 import asyncio
 import json
 import os
-import re
 from dataclasses import asdict
 from src.config import OUTPUT_DIR
-from src.models import Candidate
+from src.models import Candidate, TargetLocation
 from src.pipeline.classifier import classify_candidates
 from src.pipeline.crawler import crawl_and_extract
 from src.pipeline.discover import discover
 from src.pipeline.scorer import score_candidates
 
 
-def _make_location_slug(city: str | None, country: str) -> str:
-    """Create a filesystem-safe directory name from city/country."""
-    parts = [country]
-    if city:
-        parts.append(city)
-    slug = "_".join(parts).lower()
-    slug = re.sub(r"[^a-z0-9_]+", "_", slug)
-    slug = slug.strip("_")
-    return slug
+def _save_stage(
+    location_dir: str,
+    filename: str,
+    candidates: list[Candidate],
+    loc: TargetLocation,
+):
+    """Save stage output to a JSON file.
 
-
-def _save_stage(location_dir: str, filename: str, candidates: list[Candidate]):
-    """Save stage output to a JSON file."""
+    The location is written into the document rather than left implicit in the
+    directory name: `location.iso2` and `location.city_id` are the foreign keys
+    an importer needs to insert these rows, and parsing them back out of a
+    folder name would mean matching on country spellings.
+    """
     os.makedirs(location_dir, exist_ok=True)
     path = os.path.join(location_dir, filename)
-    data = [asdict(c) for c in candidates]
+    data = {
+        "location": asdict(loc),
+        "candidates": [asdict(c) for c in candidates],
+    }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False, default=str)
     print(f"  Saved {path} ({len(candidates)} candidates)")
 
 
 def main():
-    city = "Skopje"
-    country = "North Macedonia"
+    # Stands in for the request payload the .NET backend will post. `iso2` is
+    # the identity; the names are search-query text only.
+    location = TargetLocation(
+        iso2="MK",
+        iso3="MKD",
+        country_name="North Macedonia",
+        city="Skopje",
+        city_local_name="Скопје",
+    )
 
-    location_dir = os.path.join(OUTPUT_DIR, _make_location_slug(city, country))
+    location_dir = os.path.join(OUTPUT_DIR, location.slug)
 
-    results = discover(city, country)
-    _save_stage(location_dir, "1_discovery.json", results)
+    results = discover(location)
+    _save_stage(location_dir, "1_discovery.json", results, location)
 
     # Crawl candidates for site signals, then run LLM extraction on the same browser
     enriched = asyncio.run(crawl_and_extract(results))
-    _save_stage(location_dir, "2_crawl.json", enriched)
+    _save_stage(location_dir, "2_crawl.json", enriched, location)
 
     # Classify candidates using Ollama
     classified = classify_candidates(enriched)
-    _save_stage(location_dir, "3_classification.json", classified)
+    _save_stage(location_dir, "3_classification.json", classified, location)
 
     # Score candidates by relevance
-    scored = score_candidates(classified, city, country)
-    _save_stage(location_dir, "4_scoring.json", scored)
+    scored = score_candidates(classified, location)
+    _save_stage(location_dir, "4_scoring.json", scored, location)
 
     # Print final results grouped by classification
     for label in ("NEWS_SOURCE", "DISCOVERY_SOURCE", "REJECT"):

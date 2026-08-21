@@ -1,6 +1,45 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+
+
+@dataclass
+class TargetLocation:
+    """The place a discovery run is searching for.
+
+    Not to be confused with `Location`, which is geographic metadata *extracted
+    from a crawled site*. This is the input; that is evidence.
+
+    `iso2` is the identity — it is the primary key of the .NET `Country` table,
+    the foreign key on `City`, and what the whole pipeline keys its config on.
+    The name fields are only ever interpolated into search queries; nothing
+    matches or joins on them, because the app's own two seed CSVs spell the
+    same country differently ("North Macedonia" vs "Macedonia, The former
+    Yugoslav Rep. of").
+
+    `city_local_name` comes from `City.LocalName`, which is reverse-geocoded at
+    runtime on the .NET side and exists nowhere else — it has to arrive on the
+    request. It is what local-language queries should use: Macedonian sites
+    publish under "Скопје", not "Skopje".
+
+    `city_id` is an opaque handle echoed back untouched. City names are not
+    unique, which is why the .NET `City` primary key is a Guid.
+    """
+
+    iso2: str = ""
+    country_name: str = ""
+    iso3: str | None = None
+    city: str | None = None
+    city_local_name: str | None = None
+    city_id: str | None = None
+
+    @property
+    def slug(self) -> str:
+        """Filesystem-safe directory name, keyed on the code rather than the name."""
+        parts = [self.iso2] + ([self.city.lower()] if self.city else [])
+        slug = re.sub(r"[^A-Za-z0-9_]+", "_", "_".join(parts))
+        return slug.strip("_")
 
 
 @dataclass

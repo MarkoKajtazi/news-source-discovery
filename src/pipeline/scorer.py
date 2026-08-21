@@ -1,7 +1,6 @@
 from datetime import datetime, timezone
 
 from src.config import (
-    COUNTRY_ISO2,
     COUNTRY_LANGUAGES,
     COUNTRY_TLDS,
     FEED_FRESH_DAYS,
@@ -10,11 +9,11 @@ from src.config import (
     POLLING_TIERS,
     SCORING_WEIGHTS as WEIGHTS,
 )
-from src.models import Candidate, CrawlSignals, ScoringResult
+from src.models import Candidate, CrawlSignals, ScoringResult, TargetLocation
 
 
-def _score_tld(domain: str, country: str) -> float:
-    tlds = COUNTRY_TLDS.get(country, [])
+def _score_tld(domain: str, loc: TargetLocation) -> float:
+    tlds = COUNTRY_TLDS.get(loc.iso2, [])
     if not tlds:
         return 0.0
     for tld in tlds:
@@ -23,11 +22,11 @@ def _score_tld(domain: str, country: str) -> float:
     return 0.0
 
 
-def _score_language(signals: CrawlSignals, country: str) -> float:
+def _score_language(signals: CrawlSignals, loc: TargetLocation) -> float:
     lang = signals.language.lower().strip()
     if not lang:
         return 0.0
-    expected = COUNTRY_LANGUAGES.get(country, [])
+    expected = COUNTRY_LANGUAGES.get(loc.iso2, [])
     if not expected:
         return 0.0
     for code in expected:
@@ -115,32 +114,34 @@ def _score_confidence(candidate: Candidate) -> float:
     return candidate.classification.confidence * WEIGHTS["classification_confidence"]
 
 
-def _score_location(signals: CrawlSignals, city: str | None, country: str) -> float:
+def _score_location(signals: CrawlSignals, loc: TargetLocation) -> float:
     """Score extracted geographic metadata against the requested location.
 
     The extractors read schema.org `addressCountry` and `geo.country`, which
-    almost always carry an ISO code ("MK"), while `country` here is a full name
-    ("North Macedonia"). Comparing the two directly can never match, so the ISO
-    code is looked up rather than assumed.
+    carry an ISO 3166-1 alpha-2 code ("MK"), an alpha-3 code ("MKD"), or a full
+    name, depending on the site. All three are matched: the codes exactly, the
+    name by substring.
     """
-    loc = signals.location
-    name = loc.name.lower().strip()
-    region = loc.country.lower().strip()
+    found = signals.location
+    name = found.name.lower().strip()
+    region = found.country.strip()
     if not name and not region:
         return 0.0
 
-    if city and city.lower() in name:
-        return WEIGHTS["location_match"]
+    # The local city name is what a site in-country is likely to publish.
+    for city_form in (loc.city, loc.city_local_name):
+        if city_form and city_form.lower() in name:
+            return WEIGHTS["location_match"]
 
-    # The country field is matched exactly: a substring test on a two-letter
-    # code would let "mk" match "Denmark".
-    iso2 = COUNTRY_ISO2.get(country, "").lower()
-    if iso2 and region == iso2:
+    # Codes are matched exactly: a substring test on a two-letter code would
+    # let "MK" match "Denmark".
+    codes = {c.upper() for c in (loc.iso2, loc.iso3) if c}
+    if region.upper() in codes:
         return WEIGHTS["location_match"] * 0.6
 
     # The full name is long enough to substring-match safely, in either field.
-    full = country.lower()
-    if full in region or full in name:
+    full = loc.country_name.lower()
+    if full and (full in region.lower() or full in name):
         return WEIGHTS["location_match"] * 0.6
     return 0.0
 
@@ -152,13 +153,13 @@ def _get_polling_tier(score: float) -> str:
     return "backup"
 
 
-def score_candidate(candidate: Candidate, city: str | None, country: str) -> Candidate:
+def score_candidate(candidate: Candidate, loc: TargetLocation) -> Candidate:
     """Score a single candidate based on relevance signals."""
     signals = candidate.signals or CrawlSignals()
     breakdown = {}
 
-    breakdown["tld_match"] = _score_tld(candidate.domain, country)
-    breakdown["language_match"] = _score_language(signals, country)
+    breakdown["tld_match"] = _score_tld(candidate.domain, loc)
+    breakdown["language_match"] = _score_language(signals, loc)
     breakdown["search_occurrences"] = _score_occurrences(candidate.search_occurrences)
     breakdown["rss_available"] = _score_rss(signals)
     breakdown["article_paths"] = _score_article_paths(signals)
@@ -166,7 +167,7 @@ def score_candidate(candidate: Candidate, city: str | None, country: str) -> Can
     breakdown["has_dates"] = _score_dates(signals)
     breakdown["has_authors"] = _score_authors(signals)
     breakdown["classification_confidence"] = _score_confidence(candidate)
-    breakdown["location_match"] = _score_location(signals, city, country)
+    breakdown["location_match"] = _score_location(signals, loc)
 
     candidate.scoring = ScoringResult(
         score=round(sum(breakdown.values()), 2),
@@ -188,9 +189,17 @@ def _normalize_scores(candidates: list[Candidate]):
         c.scoring.polling_tier = _get_polling_tier(c.scoring.score)
 
 
-def score_candidates(candidates: list[Candidate], city: str | None, country: str) -> list[Candidate]:
+def score_candidates(candidates: list[Candidate], loc: TargetLocation) -> list[Candidate]:
     """Score and rank all classified candidates."""
     print(f"\nScoring {len(candidates)} candidates...\n")
+
+    if loc.iso2 not in COUNTRY_TLDS or loc.iso2 not in COUNTRY_LANGUAGES:
+        # Both lookups fall back to [], so these two signals (30 of the 100
+        # available points) would silently score zero for every candidate.
+        print(
+            f"  [warn] no TLD/language config for {loc.iso2!r} — "
+            f"tld_match and language_match will score 0 for every candidate"
+        )
 
     for candidate in candidates:
         if not candidate.classification or candidate.classification.classification == "REJECT":
@@ -200,7 +209,7 @@ def score_candidates(candidates: list[Candidate], city: str | None, country: str
                 polling_tier="rejected",
             )
             continue
-        score_candidate(candidate, city, country)
+        score_candidate(candidate, loc)
 
     _normalize_scores(candidates)
 

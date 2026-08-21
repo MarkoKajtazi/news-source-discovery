@@ -11,30 +11,38 @@ from src.config import (
     REJECTED_DOMAINS,
     REJECTED_PATTERNS,
 )
-from src.models import Candidate
+from src.models import Candidate, TargetLocation
 
 
-def generate_queries(city: str | None, country: str) -> list[str]:
-    """Build a list of search queries for the given location."""
-    templates = QUERY_TEMPLATES if city else COUNTRY_ONLY_TEMPLATES
+def generate_queries(loc: TargetLocation) -> list[str]:
+    """Build a list of search queries for the given location.
+
+    English templates use the country's display name; local-language templates
+    prefer the city's local name, because a Macedonian outlet writes "Скопје",
+    not "Skopje". Both spellings are searched — some sites do mix scripts.
+    """
+    templates = QUERY_TEMPLATES if loc.city else COUNTRY_ONLY_TEMPLATES
     queries = []
 
     for t in templates:
         try:
-            q = t.format(city=city or "", country=country).strip()
+            q = t.format(city=loc.city or "", country=loc.country_name).strip()
             if q:
                 queries.append(q)
         except KeyError:
             continue
 
-    # Adding local-language queries
-    local_terms = LOCAL_NEWS_TERMS.get(country, [])
+    # Adding local-language queries. Keyed by ISO code, not by country name.
+    local_terms = LOCAL_NEWS_TERMS.get(loc.iso2.upper(), [])
+    city_forms = [c for c in (loc.city_local_name, loc.city) if c]
     for term in local_terms:
-        if city:
-            queries.append(f"{city} {term}")
-        queries.append(f"{country} {term}")
+        for city_form in city_forms:
+            queries.append(f"{city_form} {term}")
+        queries.append(f"{loc.country_name} {term}")
 
-    return queries
+    # city_local_name may equal city, and templates can collide — dedupe while
+    # preserving order, since each query costs a rate-limited round trip.
+    return list(dict.fromkeys(queries))
 
 
 def search_ddg(query: str, max_results: int = 20) -> list[dict]:
@@ -137,12 +145,12 @@ def apply_hard_filters(candidates: dict[str, Candidate]) -> dict[str, Candidate]
     return filtered
 
 
-def discover(city: str | None, country: str) -> list[Candidate]:
+def discover(loc: TargetLocation) -> list[Candidate]:
     """Run the full discovery pipeline."""
-    location = f"{city}, {country}" if city else country
-    print(f"\nDiscovering news sources for: {location}\n")
+    where = f"{loc.city}, {loc.country_name}" if loc.city else loc.country_name
+    print(f"\nDiscovering news sources for: {where} [{loc.iso2}]\n")
 
-    queries = generate_queries(city, country)
+    queries = generate_queries(loc)
     print(f"Generated {len(queries)} search queries\n")
 
     print("Searching...")
